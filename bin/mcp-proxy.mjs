@@ -58,6 +58,13 @@ let sessionId = null;
 let usePrettyPermalinks = null; // null = not yet detected, true/false after probe
 let pendingRequests = 0;
 
+// Serialize requests after initialize to avoid PHP session file lock contention.
+let requestQueue = Promise.resolve();
+function enqueueRequest(fn) {
+  requestQueue = requestQueue.then(() => fn()).catch(() => {});
+  return requestQueue;
+}
+
 // ---------------------------------------------------------------------------
 // Logging
 // ---------------------------------------------------------------------------
@@ -115,9 +122,12 @@ function doHttpRequest(options, payload) {
     const doRequest = isHttps ? httpsRequest : httpRequest;
 
     // Allow self-signed certs for local dev domains.
+    // Disable keep-alive so each request uses a fresh socket, avoiding
+    // stale-connection issues after large responses (e.g. tools/list).
     if (isHttps && isLocalDev) {
       options.rejectUnauthorized = false;
     }
+    options.agent = false;
 
     const req = doRequest(options, (res) => {
       let body = '';
@@ -180,12 +190,6 @@ function getMcpPath() {
  * @returns {Promise<{body: string, headers: object, statusCode: number}>}
  */
 async function sendToWordPress(jsonRpcMessage) {
-  // Detect permalink structure on first request.
-  if (usePrettyPermalinks === null) {
-    usePrettyPermalinks = await detectPermalinks();
-    logStderr(`Permalink detection: ${usePrettyPermalinks ? 'pretty (/wp-json/)' : 'plain (?rest_route=)'}`);
-  }
-
   const auth = Buffer.from(`${WP_USERNAME}:${WP_APP_PASSWORD}`).toString('base64');
 
   const headers = {
@@ -356,6 +360,15 @@ if (MCP_PROTOCOL_VERSION) {
   logStderr(`Protocol version override: ${MCP_PROTOCOL_VERSION}`);
 }
 
+// Kick off permalink detection eagerly so it's done before initialize arrives.
+requestQueue = detectPermalinks().then((pretty) => {
+  usePrettyPermalinks = pretty;
+  logStderr(`Permalink detection: ${pretty ? 'pretty (/wp-json/)' : 'plain (?rest_route=)'}`);
+}).catch(() => {
+  usePrettyPermalinks = false;
+  logStderr(`Permalink detection failed, falling back to plain (?rest_route=)`);
+});
+
 const rl = createInterface({
   input: process.stdin,
   terminal: false,
@@ -364,7 +377,7 @@ const rl = createInterface({
 rl.on('line', (line) => {
   const trimmed = line.trim();
   if (!trimmed) return;
-  handleMessage(trimmed);
+  enqueueRequest(() => handleMessage(trimmed));
 });
 
 rl.on('close', async () => {
